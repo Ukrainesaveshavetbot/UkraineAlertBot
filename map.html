@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Статусы воздушных тревог Украины</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111827;color:#f3f4f6;font:16px Arial,sans-serif}
+header{padding:16px 20px;background:#1f2937}h1{font-size:20px;margin:0 0 6px}
+#note{font-size:13px;color:#cbd5e1}#map{height:65vh;min-height:420px}
+#list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;padding:14px}
+.item{background:#1f2937;padding:10px 12px;border-radius:9px}
+.item strong{display:block;margin-bottom:4px}.muted{color:#cbd5e1;font-size:13px}
+footer{padding:12px 16px;color:#cbd5e1;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+<h1>Статусы воздушных тревог Украины</h1>
+<div id="note">Загрузка данных…</div>
+</header>
+<div id="map"></div>
+<section id="list"></section>
+<footer>Информационная карта статусов по областям. Данные могут задерживаться и не заменяют официальные оповещения, сирены и указания служб. Карта не отображает местоположение или маршруты беспилотников.</footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const centers = {
+"АР Крым":[45.0,34.1],"Волынская область":[50.75,25.33],"Винницкая область":[49.23,28.47],
+"Днепропетровская область":[48.46,35.05],"Донецкая область":[48.0,37.8],"Житомирская область":[50.25,28.66],
+"Закарпатская область":[48.62,22.3],"Запорожская область":[47.84,35.14],"Ивано-Франковская область":[48.92,24.71],
+"г. Киев":[50.45,30.52],"Киевская область":[50.1,30.2],"Кировоградская область":[48.51,32.26],
+"Луганская область":[48.57,39.3],"Львовская область":[49.84,24.03],"Николаевская область":[46.97,31.99],
+"Одесская область":[46.48,30.72],"Полтавская область":[49.59,34.55],"Ровенская область":[50.62,26.25],
+"г. Севастополь":[44.62,33.52],"Сумская область":[50.91,34.8],"Тернопольская область":[49.55,25.59],
+"Харьковская область":[49.99,36.23],"Херсонская область":[46.64,32.62],"Хмельницкая область":[49.42,26.99],
+"Черкасская область":[49.44,32.06],"Черновицкая область":[48.29,25.94],"Черниговская область":[51.5,31.3]
+};
+const map=L.map('map').setView([48.8,31.2],6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'}).addTo(map);
+const colors={R:'#dc2626',A:'#dc2626',Y:'#eab308',P:'#f97316',N:'#16a34a',' ':'#64748b'};
+function label(x){return x.status||'Нет данных'}
+async function update(){
+ try{
+  const r=await fetch('/status.json?ts='+Date.now()); const rows=await r.json();
+  if(!rows.length){document.getElementById('note').textContent='Ожидаю первые данные от бота…';return}
+  document.getElementById('note').textContent='Обновлено: '+new Date().toLocaleTimeString()+' · обновление примерно раз в минуту';
+  document.getElementById('list').innerHTML=rows.map(x=>`<div class="item"><strong>${x.emoji} ${x.name}</strong><span class="muted">${label(x)}</span></div>`).join('');
+  if(window.markers) window.markers.forEach(m=>map.removeLayer(m));
+  window.markers=[];
+  rows.forEach(x=>{
+   const p=centers[x.name]; if(!p)return;
+   const marker=L.circleMarker(p,{radius:10,color:'#111827',weight:2,fillColor:colors[x.code]||'#64748b',fillOpacity:.9}).addTo(map);
+   marker.bindPopup(`<b>${x.name}</b><br>${x.emoji} ${label(x)}`);
+   window.markers.push(marker);
+  });
+ }catch(e){document.getElementById('note').textContent='Не удалось загрузить статусы. Проверь, запущен ли бот.'}
+}
+update();setInterval(update,60000);
+</script>
+</body>
+</html>
