@@ -1,0 +1,308 @@
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+
+import aiohttp
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_TOKEN = os.getenv("ALERTS_API_TOKEN", "").strip()
+POLL_SECONDS = 60
+
+if not BOT_TOKEN:
+    raise SystemExit("Укажи BOT_TOKEN в файле .env")
+if not API_TOKEN:
+    raise SystemExit("Укажи ALERTS_API_TOKEN в файле .env")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+BASE_DIR = Path(__file__).resolve().parent
+SUBSCRIBERS_FILE = BASE_DIR / "subscribers.json"
+STATUS_FILE = BASE_DIR / "status.json"
+
+# Порядок областей и коды статусов соответствуют документации alerts.in.ua.
+OBLASTS = [
+    "АР Крым", "Волынская область", "Винницкая область",
+    "Днепропетровская область", "Донецкая область", "Житомирская область",
+    "Закарпатская область", "Запорожская область", "Ивано-Франковская область",
+    "г. Киев", "Киевская область", "Кировоградская область",
+    "Луганская область", "Львовская область", "Николаевская область",
+    "Одесская область", "Полтавская область", "Ровенская область",
+    "г. Севастополь", "Сумская область", "Тернопольская область",
+    "Харьковская область", "Херсонская область", "Хмельницкая область",
+    "Черкасская область", "Черновицкая область", "Черниговская область"
+]
+CODE_LABELS = {
+    "R": ("🔴", "Воздушная тревога"),
+    "Y": ("🟡", "Предупреждение"),
+    "P": ("🟠", "Частичная тревога"),
+    "N": ("🟢", "Нет активной тревоги"),
+    " ": ("⚪", "Нет данных"),
+    "A": ("🔴", "Воздушная тревога"),
+}
+
+def read_subscribers():
+    try:
+        return set(json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+
+def save_subscribers(items):
+    SUBSCRIBERS_FILE.write_text(
+        json.dumps(sorted(items), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def normalize_status_payload(data):
+    # API обычно возвращает JSON-строку с 27 символами.
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        for key in ("active_air_raid_alerts", "data", "status"):
+            if isinstance(data.get(key), str):
+                return data[key]
+    raise ValueError("Неожиданный формат ответа API")
+
+async def fetch_statuses():
+    url = "https://api.alerts.in.ua/v2/iot/active_air_raid_alerts_by_oblast.json"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+    codes = normalize_status_payload(payload)
+    if len(codes) < len(OBLASTS):
+        raise ValueError(f"API вернуло {len(codes)} статусов вместо ожидаемых 27")
+    result = []
+    for name, code in zip(OBLASTS, codes):
+        emoji, label = CODE_LABELS.get(code, ("⚪", "Нет данных"))
+        result.append({"name": name, "code": code, "emoji": emoji, "status": label})
+    return result
+
+def format_statuses(statuses):
+    active = [x for x in statuses if x["code"] in ("R", "Y", "P", "A")]
+    if not active:
+        return "По полученным данным активных тревог сейчас нет.\n\nПроверяй официальные оповещения."
+    return "Текущие предупреждения:\n" + "\n".join(
+        f'{x["emoji"]} {x["name"]} — {x["status"]}' for x in active
+    )
+
+async def refresh_loop():
+    previous = None
+    while True:
+        try:
+            statuses = await fetch_statuses()
+            STATUS_FILE.write_text(json.dumps(statuses, ensure_ascii=False), encoding="utf-8")
+            current = {x["name"]: x["code"] for x in statuses}
+            if previous is not None:
+                changed = []
+                for item in statuses:
+                    old = previous.get(item["name"])
+                    if old != item["code"] and item["code"] in ("R", "Y", "P", "A"):
+                        changed.append(f'{item["emoji"]} {item["name"]}: {item["status"]}')
+                    elif old in ("R", "Y", "P", "A") and item["code"] == "N":
+                        changed.append(f'🟢 {item["name"]}: отбой по данным API')
+                if changed:
+                    text = "Обновление статусов тревог:\n" + "\n".join(changed)
+                    for chat_id in read_subscribers():
+                        try:
+                            await bot.send_message(int(chat_id), text)
+                        except Exception as exc:
+                            logging.warning("Не удалось отправить %s: %s", chat_id, exc)
+            previous = current
+        except Exception:
+            logging.exception("Не удалось обновить статусы. Повтор через минуту.")
+        await asyncio.sleep(POLL_SECONDS)
+
+@dp.message(Command("start"))
+async def start(message: Message):
+    subscribers = read_subscribers()
+    subscribers.add(message.chat.id)
+    save_subscribers(subscribers)
+    await message.answer(
+        "Привет! Я показываю официальные статусы воздушных тревог по областям Украины.\n\n"
+        "/alerts — текущие предупреждения\n"
+        "/map — открыть локальную интерактивную карту на этом компьютере\n"
+        "/stop — отключить уведомления\n\n"
+        "Важно: данные могут поступать с задержкой. Не используй бота вместо официальных "
+        "сирен и указаний служб."
+    )
+
+@dp.message(Command("stop"))
+async def stop(message: Message):
+    subscribers = read_subscribers()
+    subscribers.discard(message.chat.id)
+    save_subscribers(subscribers)
+    await message.answer("Уведомления отключены. Чтобы включить снова, отправь /start.")
+
+@dp.message(Command("alerts"))
+async def alerts(message: Message):
+    try:
+        statuses = await fetch_statuses()
+        await message.answer(format_statuses(statuses))
+    except Exception:
+        await message.answer("Не удалось получить данные. Проверь API-токен и подключение к интернету.")
+
+@dp.message(Command("map"))
+async def map_command(message: Message):
+    await message.answer(
+        "Интерактивная карта открывается на компьютере, где запущен бот:\n"
+        "http://127.0.0.1:8080\n\n"
+        "Если страница не открывается, запусти bot.py и попробуй ещё раз."
+    )
+
+async def map_data(request):
+    try:
+        data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = []
+    return web.json_response(data)
+
+async def map_page(request):
+    return web.FileResponse(BASE_DIR / "map.html")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", map_page)
+    app.router.add_get("/status.json", map_data)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8080)
+    await site.start()
+    logging.info("Карта доступна на http://127.0.0.1:8080")
+    return runner
+
+async def main():
+    runner = await start_web_server()
+    try:
+        await asyncio.gather(
+            dp.start_polling(bot),
+            refresh_loop()
+        )
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Статусы воздушных тревог Украины</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111827;color:#f3f4f6;font:16px Arial,sans-serif}
+header{padding:16px 20px;background:#1f2937}h1{font-size:20px;margin:0 0 6px}
+#note{font-size:13px;color:#cbd5e1}#map{height:65vh;min-height:420px}
+#list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;padding:14px}
+.item{background:#1f2937;padding:10px 12px;border-radius:9px}
+.item strong{display:block;margin-bottom:4px}.muted{color:#cbd5e1;font-size:13px}
+footer{padding:12px 16px;color:#cbd5e1;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+<h1>Статусы воздушных тревог Украины</h1>
+<div id="note">Загрузка данных…</div>
+</header>
+<div id="map"></div>
+<section id="list"></section>
+<footer>Информационная карта статусов по областям. Данные могут задерживаться и не заменяют официальные оповещения, сирены и указания служб. Карта не отображает местоположение или маршруты беспилотников.</footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const centers = {
+"АР Крым":[45.0,34.1],"Волынская область":[50.75,25.33],"Винницкая область":[49.23,28.47],
+"Днепропетровская область":[48.46,35.05],"Донецкая область":[48.0,37.8],"Житомирская область":[50.25,28.66],
+"Закарпатская область":[48.62,22.3],"Запорожская область":[47.84,35.14],"Ивано-Франковская область":[48.92,24.71],
+"г. Киев":[50.45,30.52],"Киевская область":[50.1,30.2],"Кировоградская область":[48.51,32.26],
+"Луганская область":[48.57,39.3],"Львовская область":[49.84,24.03],"Николаевская область":[46.97,31.99],
+"Одесская область":[46.48,30.72],"Полтавская область":[49.59,34.55],"Ровенская область":[50.62,26.25],
+"г. Севастополь":[44.62,33.52],"Сумская область":[50.91,34.8],"Тернопольская область":[49.55,25.59],
+"Харьковская область":[49.99,36.23],"Херсонская область":[46.64,32.62],"Хмельницкая область":[49.42,26.99],
+"Черкасская область":[49.44,32.06],"Черновицкая область":[48.29,25.94],"Черниговская область":[51.5,31.3]
+};
+const map=L.map('map').setView([48.8,31.2],6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'}).addTo(map);
+const colors={R:'#dc2626',A:'#dc2626',Y:'#eab308',P:'#f97316',N:'#16a34a',' ':'#64748b'};
+function label(x){return x.status||'Нет данных'}
+async function update(){
+ try{
+  const r=await fetch('/status.json?ts='+Date.now()); const rows=await r.json();
+  if(!rows.length){document.getElementById('note').textContent='Ожидаю первые данные от бота…';return}
+  document.getElementById('note').textContent='Обновлено: '+new Date().toLocaleTimeString()+' · обновление примерно раз в минуту';
+  document.getElementById('list').innerHTML=rows.map(x=>`<div class="item"><strong>${x.emoji} ${x.name}</strong><span class="muted">${label(x)}</span></div>`).join('');
+  if(window.markers) window.markers.forEach(m=>map.removeLayer(m));
+  window.markers=[];
+  rows.forEach(x=>{
+   const p=centers[x.name]; if(!p)return;
+   const marker=L.circleMarker(p,{radius:10,color:'#111827',weight:2,fillColor:colors[x.code]||'#64748b',fillOpacity:.9}).addTo(map);
+   marker.bindPopup(`<b>${x.name}</b><br>${x.emoji} ${label(x)}`);
+   window.markers.push(marker);
+  });
+ }catch(e){document.getElementById('note').textContent='Не удалось загрузить статусы. Проверь, запущен ли бот.'}
+}
+update();setInterval(update,60000);
+</script>
+</body>
+</html>
+
+TELEGRAM-БОТ С ОФИЦИАЛЬНЫМИ СТАТУСАМИ ВОЗДУШНЫХ ТРЕВОГ
+
+1. Установи Python 3.11 или новее с https://www.python.org/downloads/
+   При установке отметь "Add Python to PATH".
+
+2. В этой папке открой CMD (в адресной строке Проводника напиши cmd и нажми Enter).
+
+3. Установи библиотеки:
+   py -m pip install -r requirements.txt
+
+4. Создай Telegram-бота через @BotFather командой /newbot.
+   Скопируй токен бота.
+
+5. Получи персональный API-токен alerts.in.ua по инструкции:
+   https://devs.alerts.in.ua/developers
+   Токен API — секрет; не публикуй его и не отправляй никому.
+
+6. Скопируй файл .env.example и назови копию .env.
+   Открой .env в Блокноте и вставь оба токена после знака "=".
+
+7. Запусти:
+   py bot.py
+
+КОМАНДЫ В TELEGRAM
+/start   — подписаться на уведомления
+/alerts  — получить текущие статусы
+/map     — адрес локальной карты
+/stop    — отключить уведомления
+
+КАРТА
+Пока bot.py работает на этом компьютере, открой в браузере:
+http://127.0.0.1:8080
+
+ВАЖНО
+- Бот работает только пока компьютер включён, подключён к интернету и запущен bot.py.
+- Локальная карта доступна только на этом компьютере.
+- Проверка API выполняется примерно раз в минуту.
+- Данные могут поступать с задержкой. Бот не заменяет сирены, официальные приложения,
+  сообщения ОВА и указания экстренных служб.
+- Проект отображает только статусы тревог по областям; он не отслеживает координаты,
+  маршруты или предполагаемое местоположение беспилотников.
+
+aiogram>=3.7,<4.0
+aiohttp>=3.9,<4.0
+python-dotenv>=1.0,<2.0
+
+BOT_TOKEN=ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER
+ALERTS_API_TOKEN=ВСТАВЬ_ЛИЧНЫЙ_API_ТОКЕН_ALERTS_IN_UA
